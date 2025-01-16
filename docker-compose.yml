@@ -1,0 +1,338 @@
+x-airflow-common:
+  &airflow-common
+  image: ${AIRFLOW_IMAGE_NAME:-apache/airflow:2.7.1}
+  environment:
+    &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
+    AIRFLOW__CORE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
+    AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql://airflow:airflow@postgres:5432/airflow
+    AIRFLOW__CELERY__BROKER_URL: redis://:@redis:6379/0
+    AIRFLOW__CORE__FERNET_KEY: ''
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    AIRFLOW__API__AUTH_BACKEND: 'airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session'
+    AIRFLOW__SCHEDULER__ENABLE__HEALTH_CHECK: 'true'
+    _PIP_ADDITIONAL_REQUIREMENTS: ${_PIP_ADDITIONAL_REQUIREMENTS:-}
+    AIRFLOW__SCHEDULER__DAG_DIR_LIST_INTERVAL: 30
+    AIRFLOW__SMTP__SMTP_HOST: 'smtp.gmail.com'
+    AIRFLOW__SMTP__SMTP_PORT: '587'
+    AIRFLOW__SMTP__SMTP_USER: 'connextu.webtech@gmail.com'
+    AIRFLOW__SMTP__SMTP_PASSWORD: 'connextu@123'
+  volumes:
+    - ${AIRFLOW_PROJ_DIR:-.}/dags:/opt/airflow/dags
+    - ${AIRFLOW_PROJ_DIR:-.}/plugins:/opt/airflow/plugins
+    - ${AIRFLOW_PROJ_DIR:-.}/logs:/opt/airflow/logs
+    - ${AIRFLOW_PROJ_DIR:-.}/config:/opt/airflow/config
+  user: "${AIRFLOW_UID:-50000}:0"
+  depends_on:
+    &airflow-common-depends-on
+    postgres:
+      condition: service_healthy
+  networks:
+    - olivernetwork
+
+services:
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.4.0
+    container_name: zookeeper
+    restart: unless-stopped
+    ports:
+      - "2181:2181"
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    healthcheck:
+      test: ["CMD", "bash", "-c", "echo 'ruok' | nc localhost 2181"]
+      interval: 10s
+      retries: 5
+      timeout: 5s
+    networks:
+      - olivernetwork
+
+  kafka-broker:
+    image: docker.redpanda.com/redpandadata/redpanda:v24.3.2
+    container_name: kafka-broker
+    restart: unless-stopped
+    command: |
+      redpanda start 
+        --overprovisioned 
+        --smp 1 
+        --memory 1G 
+        --reserve-memory 0M 
+        --node-id 0
+        --kafka-addr internal://0.0.0.0:9092,external://0.0.0.0:19092
+        --advertise-kafka-addr internal://kafka-broker:9092,external://localhost:19092
+        --schema-registry-addr internal://0.0.0.0:8081,external://0.0.0.0:18081
+        --rpc-addr kafka-broker:33145
+        --advertise-rpc-addr localhost:33145
+        --mode dev-container
+        --set auto_create_topics_enabled=true
+    ports:
+      - 18081:18081
+      - 18082:18082
+      - 19092:19092
+      - 19644:9644
+    networks:
+      - olivernetwork
+  
+  console:
+    image: docker.redpanda.com/redpandadata/console:v2.5.1
+    container_name: console
+    restart: unless-stopped
+    entrypoint: /bin/sh
+    command: |
+      -c 'echo "$$CONSOLE_CONFIG_FILE" > /tmp/config.yml; /app/console'
+    depends_on:
+      - kafka-broker
+    ports:
+      - 8080:8080 
+    environment: 
+      CONFIG_FILEPATH: /tmp/config.yml
+      CONSOLE_CONFIG_FILE: >
+        kafka:
+          brokers: ["kafka-broker:9092"]
+          schemaRegistry: 
+            enabled: true
+            urls: ["http://kafka-broker:8081"]
+        redpanda:
+          adminApi:
+            enabled: true
+            urls: ["http://kafka-broker:9644"]
+        connect:
+          enabled: true
+          clusters:
+            - name: local-connect-clusters
+              url: http://connect:8083
+
+    networks:
+      - olivernetwork
+
+       
+
+
+
+
+
+  postgres:
+    image: postgres:13
+    container_name: postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres-db-volume:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+    networks:
+      - olivernetwork
+  
+  airflow-webserver:
+    <<: *airflow-common
+    container_name: airflow-webserver
+    command: webserver
+    ports:
+      - 8180:8080
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      retries: 5
+      timeout: 10s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+    networks:
+      - olivernetwork
+  
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: airflow-scheduler
+    command: scheduler
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8974/health"]
+      interval: 30s
+      retries: 5
+      timeout: 10s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+    networks:
+      - olivernetwork
+  
+  airflow-init:
+    <<: *airflow-common
+    container_name: airflow-init
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        function ver() {
+          printf "%04d%04d%04d%04d" $${1//./ }
+        }
+        airflow_version=$$(AIRFLOW__LOGGING__LOGGING_LEVEL=INFO && gosu airflow airflow version)
+        airflow_version_comparable=$$(ver $${airflow_version})
+        min_airflow_version=2.2.0
+        min_airflow_version_comparable=$$(ver $${min_airflow_version})
+        if (( airflow_version_comparable < min_airflow_version_comparable )); then
+          echo
+          echo -e "\033[1;31mERROR!!!: Too old Airflow version $${airflow_version}!\e[0m"
+          echo "The minimum Airflow version supported: $${min_airflow_version}. Only use this or higher!"
+          echo
+          exit 1
+        fi
+        if [ -z "$${AIRFLOW_UID}" ]; then
+          echo
+          echo -e "\033[1;33mWARNING!!!: AIRFLOW_UID not set!\e[0m"
+          echo "If you are on Linux, you SHOULD follow the instructions below to set the UID and GID"
+          echo "If you are on MacOS, you can ignore this message"
+          echo "Instructions: https://airflow.apache.org/docs/apache-airflow/stable/start/local.html#setting-the-right-airflow-user"
+          echo
+        fi
+        one_meg=1048576
+        mem_available=$$(($$(getconf _PHYS_PAGES) * $$(getconf PAGE_SIZE) / one_meg))
+        cpus_available=$$(grep -cE 'cpu[0-9]+' /proc/stat)
+        disk_available=$$(df / | tail -1 | awk '{print $$4}')
+        warning_resources="false"
+        if (( mem_available < 4000 )) ; then
+          echo
+          echo -e "\033[1;33mWARNING!!!: Not enough memory available for Docker.\e[0m"
+          echo "At least 4GB of memory required. You have $$(numfmt --to iec $$((mem_available * one_meg)))"
+          echo "Please adjust Docker resources in docker-compose.override.yml"
+          echo "See https://airflow.apache.org/docs/apache-airflow/stable/start/docker.html#before-you-begin"
+          echo
+          warning_resources="true"
+        fi
+        if (( cpus_available < 2 )); then
+          echo
+          echo -e "\033[1;33mWARNING!!!: Not enough CPUS available for Docker.\e[0m"
+          echo "At least 2 CPUs required. You have $${cpus_available}"
+          echo "Please adjust Docker resources in docker-compose.override.yml"
+          echo "See https://airflow.apache.org/docs/apache-airflow/stable/start/docker.html#before-you-begin"
+          echo
+          warning_resources="true"
+        fi
+        if (( disk_available < one_meg * 10 )); then
+          echo
+          echo -e "\033[1;33mWARNING!!!: Not enough Disk space available for Docker.\e[0m"
+          echo "At least 2GB of disk space required. You have $$(numfmt --to iec $${disk_available})"
+          echo "Please adjust Docker resources in docker-compose.override.yml"
+          echo "See https://airflow.apache.org/docs/apache-airflow/stable/start/docker.html#before-you-begin"
+          echo
+          warning_resources="true"
+        fi
+        if [ "$${warning_resources}" == "true" ]; then
+          echo
+          echo -e "\033[1;33mWARNING!!!: You have not enough resources to run Airflow in Docker!\e[0m"
+          echo "Please follow the instructions to increase amount of resources available:"
+          echo "https://airflow.apache.org/docs/apache-airflow/stable/start/docker.html#before-you-begin"
+          echo
+        fi
+        mkdir -p /sources/logs /sources/dags /sources/plugins
+        chown -R "${AIRFLOW_UID:-50000}:0" /sources/{logs,dags,plugins}
+        exec /entrypoint airflow version
+    environment:
+      <<: *airflow-common-env
+      _AIRFLOW_DB_UPGRADE: 'true'
+      _AIRFLOW_WWW_USER_CREATE: 'true'
+      _AIRFLOW_WWW_USER_USERNAME: ${_AIRFLOW_WWW_USER_USERNAME:-airflow}
+      _AIRFLOW_WWW_USER_PASSWORD: ${_AIRFLOW_WWW_USER_PASSWORD:-airflow}
+      _PIP_ADDITIONAL_REQUIREMENTS: ''
+    user: "0:0"
+    volumes:
+      - ${AIRFLOW_PROJ_DIR:-.}:/sources
+    networks:
+      - olivernetwork
+    
+  airflow-cli:
+    <<: *airflow-common
+    container_name: airflow-cli
+    profiles:
+      - debug
+    environment:
+      <<: *airflow-common-env
+      CONNECTION_CHECK_MAX_COUNT: '0'
+    command: 
+      - bash
+      - -c
+      - airflow
+    networks:
+      - olivernetwork
+
+  pinot-controller:
+    image: apachepinot/pinot:1.2.0
+    container_name: pinot-controller
+    restart: unless-stopped
+    command: "StartController -zkAddress zookeeper:2181"
+    ports:
+      - 9000:9000
+    environment:
+      JAVA_OPTS: "-Dplugins.dir=/opt/pinot/plugins -Xms1G -Xmx4G -XX:+UseG1GC -XX:MaxGCPauseMillis=200 -Xloggc:gc-pinot-controller.log"
+    depends_on:
+      - zookeeper
+    networks:
+      - olivernetwork
+    
+  pinot-broker:
+    image: apachepinot/pinot:1.2.0
+    container_name: pinot-broker
+    restart: unless-stopped
+    command: "StartBroker -zkAddress zookeeper:2181"
+    ports:
+      - 8099:8099
+    environment:
+      JAVA_OPTS: "-Dplugins.dir=/opt/pinot/plugins -Xms1G -Xmx4G -XX:+UseG1GC -XX:MaxGCPauseMillis=200 -Xloggc:gc-pinot-controller.log"
+    depends_on:
+      - pinot-controller
+    networks:
+      - olivernetwork
+    
+  pinot-server:
+    image: apachepinot/pinot:1.2.0
+    container_name: pinot-server
+    restart: unless-stopped
+    command: "StartServer -zkAddress zookeeper:2181"
+    ports:
+      - 8098:8098
+    environment:
+      JAVA_OPTS: "-Dplugins.dir=/opt/pinot/plugins -Xms1G -Xmx4G -XX:+UseG1GC -XX:MaxGCPauseMillis=200 -Xloggc:gc-pinot-controller.log"
+    depends_on:
+      - pinot-broker
+    networks:
+      - olivernetwork
+
+  superset:
+    build:
+      context: ./superset
+      dockerfile: Dockerfile
+    container_name: superset
+    restart: unless-stopped
+    environment:
+      - ADMIN_USERNAME=admin
+      - ADMIN_EMAIL=admin@superset.com
+      - ADMIN_PASSWORD=admin
+    ports:
+      - '8088:8088'
+    networks:
+      - olivernetwork
+
+
+  
+
+networks:
+  olivernetwork:
+
+volumes:
+  postgres-db-volume:
+
+
+
